@@ -2,155 +2,210 @@ import yfinance as yf
 import pandas as pd
 import requests
 import os
-from datetime import datetime
+import matplotlib.pyplot as plt
+import io
+from datetime import datetime, date
 import pytz
 
-# 設定目標股票
-# NKE: Nike (美股)
-# 9910.TW: 豐泰 (台股)
+# --- 設定區 ---
 TICKERS = {
     "US": "NKE",
     "TW": "9910.TW"
 }
-
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 def get_stock_data(ticker_symbol):
-    """
-    抓取股票數據：收盤價、基本面數據、下一次財報日
-    """
+    """抓取數據：收盤價、基本資料、行事曆"""
     stock = yf.Ticker(ticker_symbol)
     
-    # 取得歷史股價 (過去 60 天，用於計算相關性)
-    hist = stock.history(period="60d")
+    # 抓取半年 (6mo) 用於繪圖與計算
+    hist = stock.history(period="6mo")
     
-    # 取得基本資料
+    # 基本資料
     info = stock.info
     
-    return stock, hist, info
+    # 嘗試抓取行事曆 (較準確的財報日)
+    try:
+        cal = stock.calendar
+        # 不同版本的 yfinance 回傳格式不同，做個防呆
+        if isinstance(cal, dict) and 'Earnings Date' in cal:
+             # 取列表中的第一個日期
+            earnings_date = cal['Earnings Date'][0]
+        elif isinstance(cal, pd.DataFrame) and not cal.empty:
+            earnings_date = cal.iloc[0, 0]
+        else:
+            earnings_date = None
+    except:
+        earnings_date = None
+
+    return stock, hist, info, earnings_date
 
 def calculate_correlation(hist_us, hist_tw):
-    """
-    計算美股與台股近 30 天的收盤價相關係數
-    """
-    # 統一索引格式並合併數據
-    df_us = hist_us['Close'].rename("NKE")
-    df_tw = hist_tw['Close'].rename("9910")
-    
-    # 因為時區不同，我們用日期對齊 (inner join)
-    df_combined = pd.concat([df_us, df_tw], axis=1).dropna()
-    
-    # 計算近 30 筆交易日的相關係數
-    correlation = df_combined.tail(30).corr().iloc[0, 1]
-    return correlation
+    """計算近 30 天相關係數 (修復版)"""
+    try:
+        # 1. 取出收盤價
+        us_close = hist_us['Close']
+        tw_close = hist_tw['Close']
 
-def format_number(num):
-    if num is None:
-        return "N/A"
+        # 2. 移除時區資訊 (這是解決 nan 的關鍵)
+        us_close.index = us_close.index.tz_localize(None).normalize()
+        tw_close.index = tw_close.index.tz_localize(None).normalize()
+
+        # 3. 合併數據 (只保留兩邊都有開盤的日子)
+        df = pd.concat([us_close, tw_close], axis=1, keys=['US', 'TW']).dropna()
+
+        # 4. 取最近 30 筆交易日計算相關係數
+        if len(df) < 10: return 0 # 數據不足
+        corr = df.tail(30).corr().iloc[0, 1]
+        return corr
+    except Exception as e:
+        print(f"Correlation Error: {e}")
+        return 0
+
+def generate_chart(hist_us, hist_tw):
+    """繪製績效比較圖，回傳圖片 buffer"""
+    plt.style.use('dark_background') # Discord 是深色背景，這樣比較好看
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # 移除時區以便繪圖對齊
+    hist_us.index = hist_us.index.tz_localize(None)
+    hist_tw.index = hist_tw.index.tz_localize(None)
+    
+    # 正規化數據 (以第一天為基準 0%)
+    us_norm = (hist_us['Close'] / hist_us['Close'].iloc[0] - 1) * 100
+    tw_norm = (hist_tw['Close'] / hist_tw['Close'].iloc[0] - 1) * 100
+    
+    ax.plot(us_norm.index, us_norm, label='Nike (NKE)', color='#ff4d4d', linewidth=2)
+    ax.plot(tw_norm.index, tw_norm, label='Feng Tay (9910)', color='#4da6ff', linewidth=2)
+    
+    ax.set_title("Nike vs Feng Tay: 6-Month Performance Comparison (%)", fontsize=14, color='white')
+    ax.set_ylabel("Change (%)", color='white')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 儲存圖片到記憶體
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+    plt.close()
+    return buf
+
+def format_number(num, is_percent=False):
+    if num is None: return "N/A"
+    if is_percent: return f"{num * 100:.2f}"
     return f"{num:.2f}"
 
-def send_discord_notification(data):
-    """
-    發送 Discord 訊息
-    """
+def send_discord_notification(data, chart_buffer):
     if not DISCORD_WEBHOOK_URL:
         print("Error: Discord Webhook URL not found.")
         return
 
     # 解構數據
-    nke_info = data['nke_info']
-    tw_info = data['tw_info']
-    nke_hist = data['nke_hist']
-    tw_hist = data['tw_hist']
+    nke = data['nke_info']
+    tw = data['tw_info']
     corr = data['correlation']
+    earnings_date_obj = data['earnings_date']
 
-    # 計算漲跌幅
-    nke_price = nke_hist['Close'].iloc[-1]
-    nke_prev = nke_hist['Close'].iloc[-2]
-    nke_chg = (nke_price - nke_prev) / nke_prev * 100
+    # 處理財報日期顯示
+    today = date.today()
+    if earnings_date_obj:
+        # 如果是 datetime.date 轉字串，如果是 datetime 轉 date
+        e_date = earnings_date_obj.date() if isinstance(earnings_date_obj, datetime) else earnings_date_obj
+        earnings_str = str(e_date)
+        # 判斷是過去還是未來
+        if e_date < today:
+            earnings_str += " (已發布)"
+    else:
+        # 若 calendar 抓不到，嘗試用 info 中的 timestamp
+        ts = nke.get('earningsTimestamp')
+        if ts:
+            e_date = datetime.fromtimestamp(ts).date()
+            earnings_str = str(e_date)
+            if e_date < today: earnings_str += " (上季)"
+        else:
+            earnings_str = "未定"
 
-    tw_price = tw_hist['Close'].iloc[-1]
-    tw_prev = tw_hist['Close'].iloc[-2]
-    tw_chg = (tw_price - tw_prev) / tw_prev * 100
-
-    # 判斷相關性強度
-    corr_text = ""
-    if corr > 0.7: corr_text = "高度正相關 (連動強)"
-    elif corr > 0.3: corr_text = "中度正相關"
-    else: corr_text = "低相關或脫鉤"
-
-    # Nike 財報指引 (替代指標：分析師目標價與評級)
-    target_price = nke_info.get('targetMeanPrice', 'N/A')
-    recommendation = nke_info.get('recommendationKey', 'N/A').upper()
-    
-    # 下次財報日期 (嘗試抓取)
+    # 處理殖利率 (修正 548% 問題)
+    # 優先使用 dividendRate (現金股利金額) / currentPrice 計算，比較準確
     try:
-        next_earnings = datetime.fromtimestamp(nke_info.get('earningsTimestamp', 0)).strftime('%Y-%m-%d')
+        tw_yield = (tw.get('dividendRate', 0) / data['tw_hist']['Close'].iloc[-1]) * 100
     except:
-        next_earnings = "未定/未知"
+        tw_yield = 0
 
-    # 獲取當前台灣時間
-    tw_tz = pytz.timezone('Asia/Taipei')
-    now = datetime.now(tw_tz).strftime('%Y-%m-%d %H:%M')
+    # 相關性文字
+    if pd.isna(corr): corr_text = "數據不足"
+    elif corr > 0.7: corr_text = "🔗 高度連動 (跟漲跟跌)"
+    elif corr > 0.3: corr_text = "📈 中度正相關"
+    elif corr < -0.3: corr_text = "📉 負相關 (背離)"
+    else: corr_text = "💔 脫鉤/無明顯相關"
 
-    # 建構 Embed 訊息內容
+    # 獲取最新價格與漲跌
+    nke_price = data['nke_hist']['Close'].iloc[-1]
+    nke_pct = (nke_price - data['nke_hist']['Close'].iloc[-2]) / data['nke_hist']['Close'].iloc[-2] * 100
+    
+    tw_price = data['tw_hist']['Close'].iloc[-1]
+    tw_pct = (tw_price - data['tw_hist']['Close'].iloc[-2]) / data['tw_hist']['Close'].iloc[-2] * 100
+
     embed = {
-        "title": f"👟 豐泰 (9910) vs Nike (NKE) 每日追蹤",
-        "description": f"報告時間 (TW): {now}\n**策略觀點**: Nike 為豐泰最大客戶，請密切關注美股收盤後的連動效應。",
-        "color": 3447003, # 藍色
+        "title": "👟 豐泰 (9910) vs Nike (NKE) 每日深度追蹤",
+        "description": f"策略觀點：Nike 走勢為豐泰領先指標。相關係數顯示兩者目前為 **{format_number(corr)}** ({corr_text})。",
+        "color": 3447003,
         "fields": [
             {
-                "name": f"🇺🇸 Nike (NKE) - 美股剛收盤",
-                "value": f"股價: **${format_number(nke_price)}** ({nke_chg:+.2f}%)\n本益比 (PE): {format_number(nke_info.get('trailingPE'))}\n下次財報: {next_earnings}\n分析師評級: {recommendation}\n目標均價: ${target_price}",
+                "name": "🇺🇸 Nike (美股收盤)",
+                "value": f"股價: **${format_number(nke_price)}** ({nke_pct:+.2f}%)\n本益比: {format_number(nke.get('trailingPE'))}\n下次財報: {earnings_str}\n分析師評級: {nke.get('recommendationKey', 'N/A').upper()}",
                 "inline": True
             },
             {
-                "name": f"🇹🇼 豐泰 (9910) - 昨日收盤",
-                "value": f"股價: **NT${format_number(tw_price)}** ({tw_chg:+.2f}%)\n本益比 (PE): {format_number(tw_info.get('trailingPE'))}\n殖利率: {format_number(tw_info.get('dividendYield', 0)*100)}%",
+                "name": "🇹🇼 豐泰 (昨日收盤)",
+                "value": f"股價: **NT${format_number(tw_price)}** ({tw_pct:+.2f}%)\n本益比: {format_number(tw.get('trailingPE'))}\n預估殖利率: {format_number(tw_yield)}%",
                 "inline": True
-            },
-            {
-                "name": "🔗 兩者連動性分析 (近30日)",
-                "value": f"**相關係數: {format_number(corr)}**\n評價: `{corr_text}`\n(若 Nike 大漲且相關係數高，今日豐泰開高機率大)",
-                "inline": False
             }
         ],
+        "image": {
+            "url": "attachment://chart.png"
+        },
         "footer": {
-            "text": "由 GitHub Actions 自動生成 | 價值投資分析助手"
+            "text": f"報告生成時間 (TW): {datetime.now(pytz.timezone('Asia/Taipei')).strftime('%Y-%m-%d %H:%M')}"
         }
     }
 
-    payload = {
-        "embeds": [embed]
+    # 發送 Multipart 請求 (因為要傳圖片)
+    files = {
+        'file': ('chart.png', chart_buffer, 'image/png')
     }
+    payload = {
+        "payload_json": str(pd.io.json.dumps({"embeds": [embed]})) 
+    }
+    
+    # 這裡需要特殊的處理將 payload_json 轉為正確格式
+    import json
+    response = requests.post(
+        DISCORD_WEBHOOK_URL, 
+        data={"payload_json": json.dumps({"embeds": [embed]})},
+        files=files
+    )
 
-    response = requests.post(DISCORD_WEBHOOK_URL, json=payload)
-    if response.status_code == 204:
+    if response.status_code in [200, 204]:
         print("Discord notification sent successfully.")
     else:
-        print(f"Failed to send Discord notification: {response.status_code}")
+        print(f"Failed: {response.status_code}, {response.text}")
 
 def main():
-    print("Starting stock analysis...")
+    print("Starting analysis...")
+    nke_s, nke_h, nke_i, nke_e = get_stock_data(TICKERS["US"])
+    tw_s, tw_h, tw_i, tw_e = get_stock_data(TICKERS["TW"])
     
-    # 1. 獲取數據
-    nke_stock, nke_hist, nke_info = get_stock_data(TICKERS["US"])
-    tw_stock, tw_hist, tw_info = get_stock_data(TICKERS["TW"])
+    corr = calculate_correlation(nke_h, tw_h)
+    chart = generate_chart(nke_h, tw_h)
     
-    # 2. 計算相關性
-    correlation = calculate_correlation(nke_hist, tw_hist)
-    
-    # 3. 準備數據包
     data = {
-        'nke_hist': nke_hist,
-        'nke_info': nke_info,
-        'tw_hist': tw_hist,
-        'tw_info': tw_info,
-        'correlation': correlation
+        'nke_hist': nke_h, 'nke_info': nke_i, 'earnings_date': nke_e,
+        'tw_hist': tw_h, 'tw_info': tw_i,
+        'correlation': corr
     }
     
-    # 4. 發送通知
-    send_discord_notification(data)
+    send_discord_notification(data, chart)
 
 if __name__ == "__main__":
     main()

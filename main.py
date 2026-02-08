@@ -4,6 +4,7 @@ import requests
 import os
 import matplotlib.pyplot as plt
 import io
+import json  # 修正：補上這個模組
 from datetime import datetime, date
 import pytz
 
@@ -16,20 +17,22 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 def get_stock_data(ticker_symbol):
     """抓取數據：收盤價、基本資料、行事曆"""
+    print(f"Fetching data for {ticker_symbol}...")
     stock = yf.Ticker(ticker_symbol)
     
     # 抓取半年 (6mo) 用於繪圖與計算
     hist = stock.history(period="6mo")
     
     # 基本資料
-    info = stock.info
+    try:
+        info = stock.info
+    except:
+        info = {}
     
     # 嘗試抓取行事曆 (較準確的財報日)
     try:
         cal = stock.calendar
-        # 不同版本的 yfinance 回傳格式不同，做個防呆
         if isinstance(cal, dict) and 'Earnings Date' in cal:
-             # 取列表中的第一個日期
             earnings_date = cal['Earnings Date'][0]
         elif isinstance(cal, pd.DataFrame) and not cal.empty:
             earnings_date = cal.iloc[0, 0]
@@ -47,15 +50,15 @@ def calculate_correlation(hist_us, hist_tw):
         us_close = hist_us['Close']
         tw_close = hist_tw['Close']
 
-        # 2. 移除時區資訊 (這是解決 nan 的關鍵)
+        # 2. 移除時區資訊 (關鍵修復：確保時區一致)
         us_close.index = us_close.index.tz_localize(None).normalize()
         tw_close.index = tw_close.index.tz_localize(None).normalize()
 
-        # 3. 合併數據 (只保留兩邊都有開盤的日子)
-        df = pd.concat([us_close, tw_close], axis=1, keys=['US', 'TW']).dropna()
+        # 3. 合併數據 (加入 sort=True 消除警告)
+        df = pd.concat([us_close, tw_close], axis=1, keys=['US', 'TW'], sort=True).dropna()
 
         # 4. 取最近 30 筆交易日計算相關係數
-        if len(df) < 10: return 0 # 數據不足
+        if len(df) < 10: return 0 
         corr = df.tail(30).corr().iloc[0, 1]
         return corr
     except Exception as e:
@@ -64,7 +67,7 @@ def calculate_correlation(hist_us, hist_tw):
 
 def generate_chart(hist_us, hist_tw):
     """繪製績效比較圖，回傳圖片 buffer"""
-    plt.style.use('dark_background') # Discord 是深色背景，這樣比較好看
+    plt.style.use('dark_background')
     fig, ax = plt.subplots(figsize=(10, 6))
     
     # 移除時區以便繪圖對齊
@@ -72,11 +75,13 @@ def generate_chart(hist_us, hist_tw):
     hist_tw.index = hist_tw.index.tz_localize(None)
     
     # 正規化數據 (以第一天為基準 0%)
-    us_norm = (hist_us['Close'] / hist_us['Close'].iloc[0] - 1) * 100
-    tw_norm = (hist_tw['Close'] / hist_tw['Close'].iloc[0] - 1) * 100
-    
-    ax.plot(us_norm.index, us_norm, label='Nike (NKE)', color='#ff4d4d', linewidth=2)
-    ax.plot(tw_norm.index, tw_norm, label='Feng Tay (9910)', color='#4da6ff', linewidth=2)
+    # 防呆：確保不除以 0 或空值
+    if len(hist_us) > 0 and len(hist_tw) > 0:
+        us_norm = (hist_us['Close'] / hist_us['Close'].iloc[0] - 1) * 100
+        tw_norm = (hist_tw['Close'] / hist_tw['Close'].iloc[0] - 1) * 100
+        
+        ax.plot(us_norm.index, us_norm, label='Nike (NKE)', color='#ff4d4d', linewidth=2)
+        ax.plot(tw_norm.index, tw_norm, label='Feng Tay (9910)', color='#4da6ff', linewidth=2)
     
     ax.set_title("Nike vs Feng Tay: 6-Month Performance Comparison (%)", fontsize=14, color='white')
     ax.set_ylabel("Change (%)", color='white')
@@ -108,27 +113,23 @@ def send_discord_notification(data, chart_buffer):
 
     # 處理財報日期顯示
     today = date.today()
+    earnings_str = "未定"
     if earnings_date_obj:
-        # 如果是 datetime.date 轉字串，如果是 datetime 轉 date
         e_date = earnings_date_obj.date() if isinstance(earnings_date_obj, datetime) else earnings_date_obj
         earnings_str = str(e_date)
-        # 判斷是過去還是未來
-        if e_date < today:
-            earnings_str += " (已發布)"
-    else:
-        # 若 calendar 抓不到，嘗試用 info 中的 timestamp
-        ts = nke.get('earningsTimestamp')
-        if ts:
-            e_date = datetime.fromtimestamp(ts).date()
-            earnings_str = str(e_date)
-            if e_date < today: earnings_str += " (上季)"
-        else:
-            earnings_str = "未定"
+        if e_date < today: earnings_str += " (已發布)"
+    elif nke.get('earningsTimestamp'):
+        e_date = datetime.fromtimestamp(nke.get('earningsTimestamp')).date()
+        earnings_str = str(e_date)
+        if e_date < today: earnings_str += " (上季)"
 
-    # 處理殖利率 (修正 548% 問題)
-    # 優先使用 dividendRate (現金股利金額) / currentPrice 計算，比較準確
+    # 處理殖利率
     try:
-        tw_yield = (tw.get('dividendRate', 0) / data['tw_hist']['Close'].iloc[-1]) * 100
+        # 使用 dividendRate (現金股利) / currentPrice (股價)
+        if tw.get('dividendRate') and data['tw_hist']['Close'].iloc[-1]:
+            tw_yield = (tw['dividendRate'] / data['tw_hist']['Close'].iloc[-1]) * 100
+        else:
+            tw_yield = 0
     except:
         tw_yield = 0
 
@@ -139,13 +140,16 @@ def send_discord_notification(data, chart_buffer):
     elif corr < -0.3: corr_text = "📉 負相關 (背離)"
     else: corr_text = "💔 脫鉤/無明顯相關"
 
-    # 獲取最新價格與漲跌
+    # 獲取最新價格
     nke_price = data['nke_hist']['Close'].iloc[-1]
-    nke_pct = (nke_price - data['nke_hist']['Close'].iloc[-2]) / data['nke_hist']['Close'].iloc[-2] * 100
+    nke_prev = data['nke_hist']['Close'].iloc[-2]
+    nke_pct = (nke_price - nke_prev) / nke_prev * 100
     
     tw_price = data['tw_hist']['Close'].iloc[-1]
-    tw_pct = (tw_price - data['tw_hist']['Close'].iloc[-2]) / data['tw_hist']['Close'].iloc[-2] * 100
+    tw_prev = data['tw_hist']['Close'].iloc[-2]
+    tw_pct = (tw_price - tw_prev) / tw_prev * 100
 
+    # 建立 Embed 訊息
     embed = {
         "title": "👟 豐泰 (9910) vs Nike (NKE) 每日深度追蹤",
         "description": f"策略觀點：Nike 走勢為豐泰領先指標。相關係數顯示兩者目前為 **{format_number(corr)}** ({corr_text})。",
@@ -170,26 +174,24 @@ def send_discord_notification(data, chart_buffer):
         }
     }
 
-    # 發送 Multipart 請求 (因為要傳圖片)
+    # 修正：使用 json.dumps 並以 multipart/form-data 傳送
     files = {
         'file': ('chart.png', chart_buffer, 'image/png')
     }
-    payload = {
-        "payload_json": str(pd.io.json.dumps({"embeds": [embed]})) 
-    }
     
-    # 這裡需要特殊的處理將 payload_json 轉為正確格式
-    import json
+    # 這是 Discord Webhook 傳送圖片 + Embed 的標準寫法
+    payload_json = json.dumps({"embeds": [embed]})
+    
     response = requests.post(
         DISCORD_WEBHOOK_URL, 
-        data={"payload_json": json.dumps({"embeds": [embed]})},
+        data={"payload_json": payload_json},
         files=files
     )
 
     if response.status_code in [200, 204]:
         print("Discord notification sent successfully.")
     else:
-        print(f"Failed: {response.status_code}, {response.text}")
+        print(f"Failed to send: {response.status_code}, {response.text}")
 
 def main():
     print("Starting analysis...")

@@ -1,0 +1,33 @@
+name: Daily Stock Tracker (NKE vs 9910)
+
+on:
+  schedule:
+    # GitHub Actions 使用 UTC 時間
+    # 台灣時間 06:00 = UTC 22:00 (前一天)
+    - cron: '0 22 * * *'
+  
+  # 允許手動點擊按鈕觸發 (方便測試)
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Run Stock Analysis Script
+      env:
+        # 這裡會讀取你在 GitHub Repository 設定的 Secrets
+        DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      run: python main.py
